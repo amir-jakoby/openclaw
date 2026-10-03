@@ -67,6 +67,7 @@ function createGatewayContext(
   abortSignal: AbortSignal,
   options: {
     commandMenu?: boolean;
+    replyMode?: "agent" | "model";
   } = {},
 ): ChannelGatewayContext<ResolvedClickClackAccount> {
   const setStatus = vi.fn();
@@ -80,6 +81,7 @@ function createGatewayContext(
           token: "test-token",
           workspace: "main",
           reconnectMs: 1,
+          ...(options.replyMode ? { replyMode: options.replyMode } : {}),
           ...(options.commandMenu === undefined ? {} : { commandMenu: options.commandMenu }),
         },
       },
@@ -135,6 +137,7 @@ function emitMessageEvent(
 describe("ClickClack gateway", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.handleClickClackInbound.mockReset();
     mocks.createClickClackClient.mockReturnValue(mocks.client);
     mocks.client.me.mockResolvedValue({
       id: "bot-user",
@@ -353,6 +356,228 @@ describe("ClickClack gateway", () => {
     expect(runError).toBeUndefined();
   });
 
+  it.each([
+    { body: "/stop", authorized: true, replyMode: "agent", bypass: true },
+    { body: "stop", authorized: true, replyMode: "agent", bypass: true },
+    { body: "@research /stop", authorized: true, replyMode: "agent", bypass: true },
+    { body: "@someone-else /stop", authorized: true, replyMode: "agent", bypass: false },
+    { body: "/stop", authorized: false, replyMode: "agent", bypass: false },
+    { body: "/new", authorized: true, replyMode: "agent", bypass: false },
+    { body: "/stop", authorized: true, replyMode: "model", bypass: false },
+  ] as const)(
+    "routes $body with authorized=$authorized replyMode=$replyMode while a reply runs",
+    async ({ body, authorized, replyMode, bypass }) => {
+      vi.useFakeTimers();
+      const socket = new FakeSocket();
+      mocks.client.websocket.mockReturnValue(socket);
+      const first = Promise.withResolvers<void>();
+      const stopDone = Promise.withResolvers<void>();
+      const received: string[] = [];
+      const template = await mocks.client.message();
+      mocks.client.message.mockImplementation(async (id: string) => ({
+        ...template,
+        id,
+        body: id === "stop" ? body : "work",
+      }));
+      mocks.handleClickClackInbound.mockImplementation(async ({ message }) => {
+        received.push(message.id);
+        if (message.id === "work") await first.promise;
+        if (message.id === "stop") await stopDone.promise;
+      });
+      mocks.resolveClickClackInboundAccess.mockResolvedValue({
+        shouldDispatch: true,
+        commandAuthorized: authorized,
+        preparedRoute: { route: { agentId: "research" } },
+      });
+      const abort = new AbortController();
+      const ctx = createGatewayContext(abort.signal, { replyMode });
+      ctx.cfg.messages = { groupChat: { mentionPatterns: ["@research"] } };
+      const run = startClickClackGatewayAccount(ctx);
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        emitMessageEvent(socket, 1, { message_id: "work" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual(["work"]);
+        emitMessageEvent(socket, 2, { message_id: "stop" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual(bypass ? ["work", "stop"] : ["work"]);
+        first.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual(["work", "stop"]);
+        emitMessageEvent(socket, 3, { message_id: "next" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual(["work", "stop"]);
+        stopDone.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual(["work", "stop", "next"]);
+      } finally {
+        first.resolve();
+        stopDone.resolve();
+        abort.abort();
+        await run;
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["replay", "live"] as const)(
+    "admits stop behind %s work without advancing past its unfinished cursor",
+    async (source) => {
+      vi.useFakeTimers();
+      const firstSocket = new FakeSocket();
+      const secondSocket = new FakeSocket();
+      mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValue(secondSocket);
+      const first = createDeferred<void>();
+      const template = await mocks.client.message();
+      const received: string[] = [];
+      mocks.client.message.mockImplementation(async (id: string) => ({
+        ...template,
+        id,
+        body: id === "stop" ? "/stop" : "work",
+      }));
+      mocks.handleClickClackInbound.mockImplementation(async ({ message }) => {
+        received.push(message.id);
+        if (message.id === "work") await first.promise;
+      });
+      const work = { ...createBacklogEvent(1, "message.created"), payload: { message_id: "work" } };
+      const stop = { ...createBacklogEvent(2, "message.created"), payload: { message_id: "stop" } };
+      mocks.client.eventPage.mockResolvedValueOnce({ events: [], tailCursor: "start" });
+      if (source === "replay") {
+        mocks.client.eventPage.mockResolvedValueOnce({ events: [work, stop] });
+      }
+      const abort = new AbortController();
+      const run = startClickClackGatewayAccount(createGatewayContext(abort.signal));
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        if (source === "replay") {
+          firstSocket.emit("close");
+          await vi.advanceTimersByTimeAsync(100);
+          expect(mocks.client.websocket).toHaveBeenLastCalledWith("workspace-1", "cursor-2");
+        } else {
+          firstSocket.emit("message", Buffer.from(JSON.stringify(work)));
+          firstSocket.emit("message", Buffer.from(JSON.stringify(stop)));
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        expect(received).toEqual(["work", "stop"]);
+        const activeSocket = source === "replay" ? secondSocket : firstSocket;
+        activeSocket.emit("close");
+        await vi.advanceTimersByTimeAsync(100);
+        const beforeCompletion = mocks.client.websocket.mock.calls.length;
+        first.resolve();
+        await vi.advanceTimersByTimeAsync(100);
+        expect(mocks.client.websocket.mock.calls).toHaveLength(beforeCompletion + 1);
+        expect(mocks.client.eventPage).toHaveBeenLastCalledWith("workspace-1", {
+          afterCursor: "cursor-2",
+          limit: 500,
+        });
+      } finally {
+        first.resolve();
+        abort.abort();
+        await run;
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["revoked", "edited", "deleted"] as const)(
+    "refreshes a queued message after it is %s during a reply",
+    async (change) => {
+      vi.useFakeTimers();
+      const socket = new FakeSocket();
+      mocks.client.websocket.mockReturnValue(socket);
+      const work = Promise.withResolvers<void>();
+      let changed = false;
+      const received: Array<{ id: string; body: string }> = [];
+      const template = await mocks.client.message();
+      mocks.client.message.mockImplementation(async (id: string) => {
+        if (id === "queued" && changed && change === "deleted") {
+          throw new ClickClackHttpError(404, "Message deleted", new Headers());
+        }
+        return { ...template, id, body: changed && change === "edited" ? "edited" : "original" };
+      });
+      mocks.resolveClickClackInboundAccess.mockImplementation(async () => ({
+        shouldDispatch: !(changed && change === "revoked"),
+        commandAuthorized: true,
+        mentionFacts: { wasMentioned: false },
+        preparedRoute: { discussionRoute: {}, route: { agentId: "research" } },
+      }));
+      mocks.handleClickClackInbound.mockImplementation(async ({ message }) => {
+        received.push({ id: message.id, body: message.body });
+        if (message.id === "work") await work.promise;
+      });
+      const abort = new AbortController();
+      const run = startClickClackGatewayAccount(createGatewayContext(abort.signal));
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        emitMessageEvent(socket, 1, { message_id: "work" });
+        emitMessageEvent(socket, 2, { message_id: "queued" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual([{ id: "work", body: "original" }]);
+        expect(mocks.client.message).toHaveBeenCalledWith("queued");
+        changed = true;
+        work.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(received).toEqual([
+          { id: "work", body: "original" },
+          ...(change === "edited" ? [{ id: "queued", body: "edited" }] : []),
+        ]);
+      } finally {
+        work.resolve();
+        abort.abort();
+        await run;
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("settles an admitted stop before replaying a failed reply from the last committed cursor", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeSocket();
+    mocks.client.websocket.mockReturnValue(socket);
+    const work = Promise.withResolvers<void>();
+    const stop = Promise.withResolvers<void>();
+    const template = await mocks.client.message();
+    const received: string[] = [];
+    mocks.client.message.mockImplementation(async (id: string) => ({
+      ...template,
+      id,
+      body: id === "stop" ? "/stop" : "work",
+    }));
+    mocks.handleClickClackInbound.mockImplementation(async ({ message }) => {
+      received.push(message.id);
+      if (message.id === "work") await work.promise;
+      if (message.id === "stop") await stop.promise;
+    });
+    mocks.client.eventPage.mockResolvedValueOnce({ events: [], tailCursor: "start" });
+    const abort = new AbortController();
+    const run = startClickClackGatewayAccount(createGatewayContext(abort.signal));
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      emitMessageEvent(socket, 1, { message_id: "work" });
+      emitMessageEvent(socket, 2, { message_id: "stop" });
+      emitMessageEvent(socket, 3, { message_id: "next" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(received).toEqual(["work", "stop"]);
+      work.reject(new Error("reply failed"));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mocks.client.websocket).toHaveBeenCalledTimes(1);
+      expect(received).toEqual(["work", "stop"]);
+      stop.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mocks.client.websocket).toHaveBeenCalledTimes(2);
+      expect(mocks.client.eventPage).toHaveBeenLastCalledWith("workspace-1", {
+        afterCursor: "start",
+        limit: 500,
+      });
+    } finally {
+      work.resolve();
+      stop.resolve();
+      abort.abort();
+      await run;
+      vi.useRealTimers();
+    }
+  });
+
   it("processes websocket events in order before reconnecting from their cursor", async () => {
     const firstSocket = new FakeSocket();
     const secondSocket = new FakeSocket();
@@ -409,7 +634,8 @@ describe("ClickClack gateway", () => {
       setImmediate(resolve);
     });
 
-    expect(mocks.client.message).toHaveBeenCalledOnce();
+    // Lookups may run ahead to admit control messages, but shutdown still
+    // prevents the prepared ordinary message from starting a turn.
     expect(mocks.handleClickClackInbound).toHaveBeenCalledOnce();
   });
 
@@ -512,7 +738,7 @@ describe("ClickClack gateway", () => {
     emitMessageEvent(firstSocket, 1);
 
     await waitForGatewayState(() => expect(mocks.client.websocket).toHaveBeenCalledTimes(2));
-    expect(mocks.client.message).toHaveBeenCalledTimes(2);
+    expect(mocks.client.message).toHaveBeenLastCalledWith("msg-1");
     expect(mocks.handleClickClackInbound).toHaveBeenCalledOnce();
     expect(firstSocket.close).toHaveBeenCalledOnce();
     expect(mocks.client.eventPage).toHaveBeenNthCalledWith(2, "workspace-1", {
@@ -619,7 +845,14 @@ describe("ClickClack gateway", () => {
     emitMessageEvent(socket, 1, { author_id: "other-bot" });
 
     await waitForGatewayState(() => expect(mocks.handleClickClackInbound).toHaveBeenCalledTimes(1));
-    expect(mocks.resolveClickClackInboundAccess).toHaveBeenCalledTimes(1);
+    expect(mocks.resolveClickClackInboundAccess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({
+          author_id: "other-bot",
+          author: expect.objectContaining({ kind: "bot" }),
+        }),
+      }),
+    );
     abort.abort();
     await run;
   });
