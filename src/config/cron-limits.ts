@@ -5,7 +5,7 @@ export const DEFAULT_CRON_ENABLED = true;
 const DEFAULT_CRON_MAX_CONCURRENT_RUNS = 8;
 const DEFAULT_CRON_TRIGGER_MIN_INTERVAL_MS = 30_000;
 
-/** Shared capacity for cron execution and hook dispatch from validated config. */
+/** Configured cron service cap and shared cron-agent/hook lane budget. */
 export function resolveCronMaxConcurrentRuns(
   cronConfig?: Pick<CronConfig, "maxConcurrentRuns">,
 ): number {
