@@ -361,3 +361,15 @@ describe("dead config keys", () => {
     });
   });
 });
+
+describe("gateway stop timeout configuration", () => {
+  it.each([undefined, 15_000, 60_000, 325_000])("accepts %s", (stopTimeoutMs) => {
+    expect(validateConfigObjectRaw({ gateway: { stopTimeoutMs } }).ok).toBe(true);
+  });
+  it.each([0, -1, 14_999, 325_001, 60_000.5, Infinity, Number.NaN, "60000"])(
+    "rejects invalid timeout %s",
+    (stopTimeoutMs) => {
+      expect(validateConfigObjectRaw({ gateway: { stopTimeoutMs } }).ok).toBe(false);
+    },
+  );
+});
