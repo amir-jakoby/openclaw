@@ -36,11 +36,9 @@ import {
   type GatewayRunSignalRequest,
 } from "./run-loop-request.js";
 import {
-  resolveGatewayRequestShutdownBudget,
   resolveGatewayShutdownDrainBudget,
   resolveGatewayShutdownBudget,
 } from "./run-loop-shutdown-budget.js";
-import { createGatewayShutdownDeadline } from "./run-loop-shutdown-deadline.js";
 import * as loopCompletion from "./run-loop-shutdown-format.js";
 import {
   createGatewayRestartRecovery,
@@ -49,6 +47,10 @@ import {
   type GatewayRunLoopStartOptions,
   type GatewayRestartStartupFailureHandler,
 } from "./run-loop-startup.js";
+import {
+  armShutdownHardExitWatchdog,
+  type ShutdownHardExitWatchdog,
+} from "./shutdown-hard-exit.js";
 import { GatewayUpdateSuccessor } from "./update-successor.js";
 const gatewayLog = createSubsystemLogger("gateway");
 const LAUNCHD_SUPERVISED_RESTART_EXIT_DELAY_MS = 1500;
@@ -67,7 +69,6 @@ export async function runGatewayLoop(params: {
   runtime: RuntimeEnv;
   /** Grants this run loop authority over the process it exclusively owns. */
   ownsProcessLifecycle?: boolean;
-  stopTimeoutMs?: number;
   lockPort?: number;
   lifecycleLockDeadlineMs?: number;
   healthHost?: string;
@@ -75,7 +76,6 @@ export async function runGatewayLoop(params: {
   completeBoot?: (completion: GatewayBootLifecycleCompletion) => void;
   onRestartStartupFailure?: GatewayRestartStartupFailureHandler;
 }) {
-  const configuredStopTimeoutMs = params.stopTimeoutMs;
   // macOS/BSD process inspection reports process.title instead of the original
   // argv. Give the long-running Gateway a verifiable identity for lock readers.
   if (process.title === "openclaw") {
@@ -700,13 +700,17 @@ export async function runGatewayLoop(params: {
     } else if (!isRestart) {
       startGatewayRestartTrace("stop.signal.received", [["signal", acceptedRequest.signal]]);
     }
+    let forceExitTimer: ReturnType<typeof setTimeout> | null = null;
+    let shutdownDeadline: number | undefined;
+    let hardExitWatchdog: ShutdownHardExitWatchdog | null = null;
     let lastDrainCounts = "not observed";
     let shutdownFailure: ShutdownFailure | undefined;
-    const shutdownTimer = createGatewayShutdownDeadline({
-      ownsProcessLifecycle: params.ownsProcessLifecycle === true,
-      hardExitGraceMs: HARD_EXIT_WATCHDOG_GRACE_MS,
-      canArm: () => !(updateSuccessor.waitingForStop && !getManagedUpdateOwner()),
-      onTimeout: () => {
+    const armForceExitTimer = (forceExitMs: number) => {
+      if (forceExitTimer || (updateSuccessor.waitingForStop && !getManagedUpdateOwner())) {
+        return;
+      }
+      shutdownDeadline = performance.now() + forceExitMs;
+      forceExitTimer = setTimeout(() => {
         const exitOk = budget.nativeStopBudget && !restartWithoutSupervisor && !shutdownFailure;
         gatewayLog.warn(
           `shutdown deadline reached; abandoning unfinished cleanup and active work before ${action}; last observed: ${lastDrainCounts}; cleanup incomplete; exitCode=${exitOk ? 0 : 1}`,
@@ -716,14 +720,25 @@ export async function runGatewayLoop(params: {
           exitOk ? 0 : 1,
           shutdownFailure,
         );
-      },
-      onWatchdogError: (error) =>
-        gatewayLog.warn(
-          `hard-exit watchdog failed; retaining main-thread shutdown timer: ${formatErrorMessage(error)}`,
-        ),
-    });
-    const armForceExitTimer = shutdownTimer.arm;
-    const clearForceExitTimer = shutdownTimer.clear;
+      }, forceExitMs);
+      if (params.ownsProcessLifecycle === true) {
+        hardExitWatchdog = armShutdownHardExitWatchdog({
+          delayMs: forceExitMs + HARD_EXIT_WATCHDOG_GRACE_MS,
+          onError: (error) => {
+            gatewayLog.warn(
+              `hard-exit watchdog failed; retaining main-thread shutdown timer: ${formatErrorMessage(error)}`,
+            );
+          },
+        });
+      }
+    };
+    const clearForceExitTimer = () => {
+      clearTimeout(forceExitTimer ?? undefined);
+      forceExitTimer = null;
+      shutdownDeadline = undefined;
+      hardExitWatchdog?.cancel();
+      hardExitWatchdog = null;
+    };
     if (action === "restart") {
       forceActiveRestartExit = () => {
         clearForceExitTimer();
@@ -734,29 +749,20 @@ export async function runGatewayLoop(params: {
     }
 
     const completion = (async () => {
-      budget = await resolveGatewayRequestShutdownBudget({
-        supervisor: supervisorMode,
-        logger: gatewayLog,
-        startupBudget,
-        acceptedAtMs: acceptedRequest.acceptedAtMs,
-        stopTimeoutMs: action === "stop" ? configuredStopTimeoutMs : undefined,
-        onDeadline: (next) => {
-          if (forcedExitStarted) {
-            return;
-          }
-          clearForceExitTimer();
-          if (next) {
-            budget = next;
-            if (!getManagedUpdateOwner()) {
-              armForceExitTimer(budget.timeoutMs);
-            }
-          }
-        },
-      });
-      if (forcedExitStarted) {
-        return;
+      if (process.platform === "linux" || process.platform === "darwin") {
+        if (budget.nativeStopBudget && !getManagedUpdateOwner()) {
+          armForceExitTimer(budget.timeoutMs);
+        }
+        budget = await resolveGatewayShutdownBudget(supervisorMode, gatewayLog, {
+          previous: startupBudget,
+          acceptedAtMs: acceptedRequest.acceptedAtMs,
+        });
+        if (forcedExitStarted) {
+          return;
+        }
+        reportedBudget = budget;
+        clearForceExitTimer();
       }
-      reportedBudget = budget;
       budget.log("shutdown");
       let managedUpdateOwner: GatewayRestartIntent["successorOwner"];
       let managedUpdateCancellation:
@@ -831,7 +837,7 @@ export async function runGatewayLoop(params: {
           }
         }
 
-        if (isRestart && !shutdownTimer.armed) {
+        if (isRestart && !forceExitTimer) {
           armForceExitTimer(drainBudget.restartTimeoutMs());
         }
         if (acceptedRequest.action === "stop") {
@@ -840,7 +846,7 @@ export async function runGatewayLoop(params: {
         }
         shutdownStep = "gateway-server-close";
         await runWithProcessCleanupBudget(
-          budget.cleanupBudget(shutdownTimer.deadline, HARD_EXIT_WATCHDOG_GRACE_MS),
+          budget.cleanupBudget(shutdownDeadline, HARD_EXIT_WATCHDOG_GRACE_MS),
           () =>
             server?.close({
               reason: isRestart ? "gateway restarting" : "gateway stopping",

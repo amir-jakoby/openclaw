@@ -375,7 +375,6 @@ async function runLoopWithStart(params: {
   start: ReturnType<typeof vi.fn>;
   runtime: RuntimeEnv;
   ownsProcessLifecycle?: boolean;
-  stopTimeoutMs?: number;
   lockPort?: number;
   healthHost?: string;
   beginBoot?: (startedAtMs: number) => void | Promise<void>;
@@ -387,7 +386,6 @@ async function runLoopWithStart(params: {
     start: params.start as unknown as Parameters<typeof runGatewayLoop>[0]["start"],
     runtime: params.runtime,
     ownsProcessLifecycle: params.ownsProcessLifecycle,
-    stopTimeoutMs: params.stopTimeoutMs,
     lockPort: params.lockPort,
     healthHost: params.healthHost,
     beginBoot: params.beginBoot,

@@ -17,12 +17,7 @@ type LaunchdStopTimeout = { timeoutMs: number; source: string };
 // A warning without a deadline means inspection was inconclusive. Only a
 // confirmed launchd stop or our launcher's independent reap timer yields a
 // native budget; the caller owns the fallback policy.
-export type LaunchdStopRead = {
-  stop: LaunchdStopTimeout | null;
-  warning?: string;
-  /** Independently known launcher bound when the job timeout is only a fallback. */
-  observedTimeoutMs?: number;
-};
+export type LaunchdStopRead = { stop: LaunchdStopTimeout | null; warning?: string };
 
 const LAUNCHCTL_PRINT_TIMEOUT_MS = 2_000;
 
@@ -173,10 +168,7 @@ export async function readLaunchdStopTimeout(
     }
     const seconds = parseStrictPositiveInteger(rawSeconds ?? "");
     if (seconds === undefined) {
-      return {
-        ...defaultStopDeadline(target, "its exit timeout is missing or invalid"),
-        ...(launcherMs !== undefined ? { observedTimeoutMs: launcherMs } : {}),
-      };
+      return defaultStopDeadline(target, "its exit timeout is missing or invalid");
     }
     const jobMs = seconds * 1_000;
     // A parent that reaps this process on its own timer binds before the job's
